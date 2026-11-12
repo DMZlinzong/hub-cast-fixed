@@ -103,6 +103,12 @@ class GaodeWatcher(
     var lastLightExtrasDump = ""
         private set
 
+    /** 1.80：60073 到达计数（诊断行显示）。=0 说明引擎从未导出巡航红绿灯
+     *  广播 → cruise.param.enable_traffic_light 门禁未放行（发送端问题）。 */
+    @Volatile
+    var light60073Count: Int = 0
+        private set
+
     private fun stopLanePoll() {
         lanePollRunning = false
         lanePollHandler.removeCallbacks(lanePollTask)
@@ -202,6 +208,8 @@ class GaodeWatcher(
                     intent.hasExtra("EXTRA_TRAFFIC_LIGHT_REMAIN_SECONDS") ||
                     intent.hasExtra("EXTRA_TRAFFIC_LIGHT_COUNTDOWNSECONDS")
                 if (type == 60073 || hasLightKeys) {
+                    // 1.80：60073 到达计数（区分门禁未放行与键名形态问题）
+                    if (type == 60073) light60073Count++
                     // 1.69：诊断行完整 extras 透出——车机层（华阳）若换键名一张照片可定位
                     val st = pickIntExtra(intent, "trafficLightStatus", "EXTRA_TRAFFIC_LIGHT_STATUS")
                     val red = pickIntExtra(intent, "redLightCountDownSeconds")
@@ -216,10 +224,32 @@ class GaodeWatcher(
                     // 1.64：完整 extras 透出到诊断行（beep 广播已在上方被过滤，不会覆盖）
                     lastLightExtrasDump = "红绿灯广播$type 完整extras: ${extraVals.take(220)}"
                     // 1.76：数组形态 extras 全量提取（巡航分组倒计时）
-                    val remainList = pickIntList(
+                    var remainList = pickIntList(
                         intent,
                         "EXTRA_TRAFFIC_LIGHT_REMAIN_SECONDS", "EXTRA_TRAFFIC_LIGHT_COUNTDOWNSECONDS"
                     )
+                    // 1.80：倒数泛化扫描——已知键全部缺失但有灯色时，扫描 extras
+                    // 里任何含 countdown/remain/second 的数字键（1..300 秒合理域）。
+                    // 华阳车机层换键名形态时自动抓到倒数；候选全部交给解析层
+                    // 锁定仲裁挑本车灯组，诊断行会显示「列表=…」供校准。
+                    if ((st > 0 || wr > 0) && remain < 0 && remainList.isEmpty()) {
+                        val found = ArrayList<Pair<String, Int>>()
+                        for (k in intent.extras?.keySet() ?: emptySet()) {
+                            val lk = k.lowercase()
+                            if (("count" in lk || "remain" in lk || "second" in lk) &&
+                                "waitround" !in lk && "key_type" !in lk
+                            ) {
+                                val v = pickIntExtra(intent, k)
+                                if (v in 1..300) found.add(k to v)
+                            }
+                        }
+                        if (found.isNotEmpty()) {
+                            Log.i(TAG, "红绿灯倒数泛化扫描命中(type=$type)：$found")
+                            remainList = found.map { it.second }
+                            lastLightExtrasDump = "倒数泛化命中$type: " +
+                                found.joinToString(",") { "${it.first}=${it.second}" }
+                        }
+                    }
                     onLightExtras?.invoke(st, red, green, dir, wr, type, remain, remainList)
                 }
                 when {

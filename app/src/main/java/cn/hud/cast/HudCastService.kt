@@ -669,6 +669,8 @@ class HudCastService : Service(), HudPresentation.Callback {
             if (it.lastBcastTypes.isNotEmpty()) protocol?.bcastDbg = it.lastBcastTypes
             // 1.64：红绿灯类广播完整 extras 同步到诊断行（巡航键名校准）
             if (it.lastLightExtrasDump.isNotEmpty()) protocol?.lightExtrasDbg = it.lastLightExtrasDump
+            // 1.80：60073 到达计数同步（诊断行判断发送端门禁状态）
+            protocol?.light60073Count = it.light60073Count
         }
         // 1.44：引导数据是否有「实际变化」（距离递减 / 转向 / 道路 / 全程信息）。
         // 行驶中每秒都在变；到达目的地或退出导航后高德停推或重复同一值，

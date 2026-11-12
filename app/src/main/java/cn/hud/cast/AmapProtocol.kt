@@ -1018,6 +1018,10 @@ class AmapProtocol(
     /** 1.64：红绿灯类广播的完整 extras（GaodeWatcher 侧透出，诊断行显示） */
     var lightExtrasDbg: String = ""
 
+    /** 1.80：60073 到达计数（HudCastService 同步自 GaodeWatcher）。
+     *  诊断行显示；=0 说明引擎从未导出该广播 → 发送端门禁/未放行。 */
+    var light60073Count: Int = 0
+
     /** 1.53：限速来源诊断（广播 / 深扫命中时记录键值，供实拍校准） */
     var speedDbg: String = ""
 
@@ -1164,13 +1168,16 @@ class AmapProtocol(
      * 诊断行：三路原始值合并显示、互不覆盖。
      * 之前各解析器轮流覆盖同一个字符串，车道原始值几乎总是被转向/红绿灯
      * 冲掉，「车道全直行」这类问题拿不到关键数据。
+     * 1.80：红绿灯两行置顶——巡航倒数排查时第一屏照片必须看到红绿灯数据行，
+     * 车道行已经稳定不再需要每次校准。
      */
     val debugInfo: String
         get() = listOf(
-            laneDbg, turnDbg, lightDbg,
+            lightDbg,
+            if (lightExtrasDbg.isNotEmpty()) lightExtrasDbg else "",
+            laneDbg, turnDbg,
             if (bcastDbg.isNotEmpty()) "广播类型=$bcastDbg" else "",
-            if (speedDbg.isNotEmpty()) speedDbg else "",
-            if (lightExtrasDbg.isNotEmpty()) lightExtrasDbg else ""
+            if (speedDbg.isNotEmpty()) speedDbg else ""
         )
             .filter { it.isNotEmpty() }
             .joinToString("\n")
@@ -1365,11 +1372,15 @@ class AmapProtocol(
         // 1.76：多方向倒数列表透出（巡航分组倒计时的数组形态）
         // 1.78：锁定标记——「列表=41,36 锁36」表示当前灯组锁定在 36
         val listDump = pickStr(lightSrc, "countDownList")
+        // 1.80：秒缺标注——灯色到达但倒数缺失时直接在行尾标出，一张照片即可
+        // 区分「发送端没发倒数（门禁）」与「接收端显示问题」
+        val secMissing = if (status in 1..3 && seconds < 0) " 【倒数缺失→发送端未下发】" else ""
         lightDbg = "红绿灯[$srcLabel]" +
             (if (rawDump.isNotEmpty()) "原始=$rawDump → " else "") +
             (if (listDump != null) "列表=$listDump${if (listLocked) " 锁$genSec" else ""} " else "") +
             "st=$explicit r=$redSec g=$greenSec gen=$genSec dir=${pickOptInt(lightSrc, "dir") ?: -1} " +
-            "wr=${pickOptInt(lightSrc, "waitRound") ?: -1} → 判定=${if (status in 1..3) status else "无"}"
+            "wr=${pickOptInt(lightSrc, "waitRound") ?: -1} → 判定=${if (status in 1..3) status else "无"}" +
+            secMissing + " ·60073×$light60073Count"
 
         // 有效状态（1 红 / 2 绿 / 3 黄）
         if (status > 0) {            // 秒数缺失时沿用上一次的值（高德有时只发状态不发倒数），
