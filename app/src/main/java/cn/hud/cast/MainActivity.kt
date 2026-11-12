@@ -32,6 +32,39 @@ class MainActivity : Activity() {
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
 
+    /** 1.81：屏幕直读诊断日志区（车机没有文件管理器，拍照即可回传）。 */
+    private lateinit var logText: TextView
+    private val logRefresh = android.os.Handler(android.os.Looper.getMainLooper())
+    private val logRefreshTask = object : Runnable {
+        override fun run() {
+            updateLogView()
+            logRefresh.postDelayed(this, 1000L)
+        }
+    }
+
+    private fun updateLogView() {
+        if (!this::logText.isInitialized) return
+        val lines = try {
+            DebugLog.recent(80)
+        } catch (_: Throwable) {
+            emptyList()
+        }
+        if (lines.isEmpty()) return
+        logText.text = lines.joinToString("\n")
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshHudProbe()
+        logRefresh.removeCallbacks(logRefreshTask)
+        logRefresh.post(logRefreshTask)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        logRefresh.removeCallbacks(logRefreshTask)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         config = CastConfig(this)
@@ -39,8 +72,8 @@ class MainActivity : Activity() {
         setContentView(buildUi())
         StatusBus.register(statusListener)
         ensureNotificationPermission()
-        // 1.80：诊断日志启动标记（区分会话；版本号 1.80 与构建脚本一致）
-        DebugLog.line("日志", "App 启动，版本=1.80(81) 诊断版")
+        // 1.81：诊断日志启动标记（区分会话；版本号与构建脚本一致）
+        DebugLog.line("日志", "App 启动，版本=1.81(82) 诊断版（屏幕直读）")
         // 1.29：打开 App 直接开始投屏（默认开启，可在界面里关掉）
         autoStartOnLaunch()
     }
@@ -80,11 +113,6 @@ class MainActivity : Activity() {
         }
         StatusBus.publish(Status.casting("已自动开始投屏：正在连接车机版高德数据服务…"))
         HudCastService.startCard(this)
-    }
-
-    override fun onResume() {
-        super.onResume()
-        refreshHudProbe()
     }
 
     override fun onDestroy() {
@@ -193,6 +221,31 @@ class MainActivity : Activity() {
             setPadding(0, 0, 0, dp(12))
         }
         root.addView(hudText)
+
+        // 1.81：诊断日志直接显示在屏幕上（车机没有文件管理器，拍照即可回传）
+        root.addView(section("巡航诊断日志（屏幕直读，拍照发回即可）"))
+        logText = TextView(this).apply {
+            textSize = 9f
+            setTextColor(Color.parseColor("#7CE8A0"))
+            typeface = android.graphics.Typeface.MONOSPACE
+            setPadding(0, dp(4), 0, dp(4))
+            text = "（等待数据：开启高德巡航后这里会滚动显示收到的广播与红绿灯解析）"
+        }
+        root.addView(logText)
+        val logRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.START
+        }
+        logRow.addView(button("刷新") {
+            updateLogView()
+        })
+        logRow.addView(space(dp(12)))
+        logRow.addView(button("清屏") {
+            DebugLog.memClear()
+            updateLogView()
+        })
+        root.addView(logRow)
+
         buildDisplayPicker(root)
         buildCardEditor(root)
         buildLightOffsetControls(root)

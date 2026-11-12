@@ -37,16 +37,35 @@ object DebugLog {
         }
     }
 
-    /** 追加一行日志。任何异常静默忽略——诊断功能绝不能影响投屏主链路。 */
+    /** 1.81：内存环形缓冲（最近 150 行）——车机没有文件管理器可用时，
+     *  日志直接显示在 App 主界面，拍照即可回传。 */
+    private val mem = ArrayDeque<String>()
+
+    /** 追加一行日志。同时写入内存缓冲与文件（文件失败不影响内存）。 */
     @Synchronized
     fun line(tag: String, msg: String) {
+        val entry = "${fmt.format(Date())} [$tag] $msg"
+        mem.addLast(entry)
+        while (mem.size > 150) mem.removeFirst()
         val d = dir ?: return
         try {
             val f = File(d, "cruise_debug.txt")
             if (f.exists() && f.length() > MAX_BYTES) rotate(d)
-            f.appendText("${fmt.format(Date())} [$tag] $msg\n")
+            f.appendText(entry + "\n")
         } catch (_: Throwable) {
         }
+    }
+
+    /** 1.81：屏幕显示用——取最近 maxLines 行。 */
+    @Synchronized
+    fun recent(maxLines: Int = 150): List<String> =
+        mem.takeLast(maxLines)
+
+    /** 1.81：清空内存缓冲（文件保留）。 */
+    @Synchronized
+    fun memClear() {
+        mem.clear()
+        line("日志", "屏幕日志已清空，等待新数据")
     }
 
     /** 轮转：cruise_debug.txt → .1 → .2（最老丢弃）。 */

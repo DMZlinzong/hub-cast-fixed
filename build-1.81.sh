@@ -1,12 +1,12 @@
 #!/bin/bash
-# HUD 投屏 1.80 手工构建链（aapt2 link → kotlinc → d8 → zip → zipalign → apksigner）
+# HUD 投屏 1.81 手工构建链（aapt2 link → kotlinc → d8 → zip → zipalign → apksigner）
 set -e
 SDK=/opt/android-sdk
 BT=$SDK/build-tools/35.0.0
 AJ=$SDK/platforms/android-35/android.jar
 KOTLINC=/opt/kotlinc/bin/kotlinc
 SRC=/workspace/hud-cast/app/src/main/java/cn/hud/cast
-B=/tmp/apkbuild180
+B=/tmp/apkbuild181
 
 rm -rf $B
 mkdir -p $B/classes $B/dex
@@ -17,7 +17,7 @@ $BT/aapt2 link -o base.apk \
   -I $AJ \
   --manifest /tmp/apkbuild/AndroidManifest.xml \
   --min-sdk-version 24 --target-sdk-version 35 \
-  --version-code 81 --version-name 1.80 \
+  --version-code 82 --version-name 1.81 \
   /tmp/apkbuild/res.zip
 
 echo "=== 2. kotlinc ==="
@@ -40,8 +40,8 @@ $BT/zipalign -f -p 4 unsigned.apk aligned.apk
 
 echo "=== 7. apksigner ==="
 $BT/apksigner sign --ks /tmp/apkbuild/hud.jks --ks-key-alias hud \
-  --ks-pass pass:hudcast --out /workspace/HUD投屏-1.80.apk aligned.apk
-$BT/apksigner verify --print-certs /workspace/HUD投屏-1.80.apk | head -4
+  --ks-pass pass:hudcast --out /workspace/HUD投屏-1.81.apk aligned.apk
+$BT/apksigner verify --print-certs /workspace/HUD投屏-1.81.apk | head -4
 
 echo "=== 完成 ==="
-ls -la /workspace/HUD投屏-1.80.apk
+ls -la /workspace/HUD投屏-1.81.apk
