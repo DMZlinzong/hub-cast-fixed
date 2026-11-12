@@ -188,6 +188,9 @@ class HudCastService : Service(), HudPresentation.Callback {
         super.onCreate()
         instance = this
         config = CastConfig(this)
+        // 1.80：诊断日志初始化（开机自启路径不经过 MainActivity）
+        DebugLog.init(this)
+        DebugLog.line("日志", "HudCastService onCreate（开机自启/后台常驻路径）")
         createChannel()
         StatusBus.notifier = { status ->
             try {

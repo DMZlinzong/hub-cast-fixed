@@ -35,11 +35,37 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         config = CastConfig(this)
+        DebugLog.init(this)
         setContentView(buildUi())
         StatusBus.register(statusListener)
         ensureNotificationPermission()
+        // 1.80：诊断日志启动标记（区分会话；版本号 1.80 与构建脚本一致）
+        DebugLog.line("日志", "App 启动，版本=1.80(81) 诊断版")
         // 1.29：打开 App 直接开始投屏（默认开启，可在界面里关掉）
         autoStartOnLaunch()
+    }
+
+    /** 1.80：导出诊断日志到 /sdcard/Download（需存储权限，Android 9 运行时申请）。 */
+    private fun exportDebugLog() {
+        val perm = Manifest.permission.WRITE_EXTERNAL_STORAGE
+        if (checkSelfPermission(perm) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(perm), 4001)
+            return
+        }
+        val (ok, msg) = DebugLog.exportToDownload(this)
+        Toast.makeText(this, msg, if (ok) Toast.LENGTH_LONG else Toast.LENGTH_LONG).show()
+        DebugLog.line("日志", "导出: ok=$ok $msg")
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 4001) {
+            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+                exportDebugLog()
+            } else {
+                Toast.makeText(this, "未授予存储权限，无法导出日志", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     /**
@@ -187,6 +213,25 @@ class MainActivity : Activity() {
         actionRow.addView(space(dp(12)))
         actionRow.addView(stopButton)
         root.addView(actionRow)
+
+        // 1.80：诊断日志导出（巡航红绿灯排查专用）
+        root.addView(hint(
+            "巡航红绿灯不显示时：车机正常开巡航跑一段（让高德显示倒计时），\n" +
+                "回到本页点「导出诊断日志」，把 Download 目录里的 txt 发回来即可定位。"
+        ))
+        val dbgRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.START
+        }
+        dbgRow.addView(button("导出诊断日志") {
+            exportDebugLog()
+        })
+        dbgRow.addView(space(dp(12)))
+        dbgRow.addView(button("清空日志") {
+            DebugLog.clear()
+            Toast.makeText(this, "日志已清空", Toast.LENGTH_SHORT).show()
+        })
+        root.addView(dbgRow)
 
         // 1.41：整页纯黑背景（车机夜间使用不刺眼）
         root.setBackgroundColor(Color.BLACK)

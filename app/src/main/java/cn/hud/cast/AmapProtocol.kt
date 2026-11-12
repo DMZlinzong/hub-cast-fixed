@@ -387,7 +387,11 @@ class AmapProtocol(
         // 「无红绿灯」触发清空判定，把已有的分行数据冲掉。
         if (status < 0 && red < 0 && green < 0 && dir < 0 && waitRound < 0 &&
             remain < 0 && remainList.isEmpty()
-        ) return
+        ) {
+            DebugLog.line("入口", "feedLightBroadcast 全空忽略: st=$status r=$red g=$green dir=$dir wr=$waitRound remain=$remain list=$remainList")
+            return
+        }
+        DebugLog.line("入口", "feedLightBroadcast: st=$status r=$red g=$green dir=$dir wr=$waitRound src=60073?=$srcType remain=$remain list=$remainList")
         // 1.79：waitRound（等待轮数）来自发送端 wh0.c 确认语义——红灯等待时
         // >0。状态键缺失（华阳车机层换键形态）时用它兜底判红。
         val effStatus = if (status < 1 && waitRound > 0) 1 else status
@@ -1375,6 +1379,13 @@ class AmapProtocol(
         // 1.80：秒缺标注——灯色到达但倒数缺失时直接在行尾标出，一张照片即可
         // 区分「发送端没发倒数（门禁）」与「接收端显示问题」
         val secMissing = if (status in 1..3 && seconds < 0) " 【倒数缺失→发送端未下发】" else ""
+        // 1.80：诊断日志——解析结果全量落盘（灯色/秒数/来源/列表/失效原因）
+        DebugLog.line(
+            "解析",
+            "src=$srcLabel st=$explicit r=$redSec g=$greenSec gen=$genSec " +
+                "wr=${pickOptInt(lightSrc, "waitRound") ?: -1} list=$listDump 锁定=$listLocked " +
+                "→ 判定=${if (status in 1..3) status else "无"} 秒=$seconds$secMissing"
+        )
         lightDbg = "红绿灯[$srcLabel]" +
             (if (rawDump.isNotEmpty()) "原始=$rawDump → " else "") +
             (if (listDump != null) "列表=$listDump${if (listLocked) " 锁$genSec" else ""} " else "") +
