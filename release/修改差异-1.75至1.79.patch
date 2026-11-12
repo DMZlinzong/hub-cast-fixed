@@ -1,0 +1,979 @@
+diff -ru /tmp/prev_src/hud-cast/app/src/main/java/cn/hud/cast/AmapProtocol.kt /workspace/hud-cast/app/src/main/java/cn/hud/cast/AmapProtocol.kt
+--- /tmp/prev_src/hud-cast/app/src/main/java/cn/hud/cast/AmapProtocol.kt	2026-11-11 07:00:14.000000000 +0800
++++ /workspace/hud-cast/app/src/main/java/cn/hud/cast/AmapProtocol.kt	2026-11-12 05:36:51.401929000 +0800
+@@ -147,8 +147,32 @@
+     /** 1.53：限速字段的来源协议号（首次深扫命中后，只对该协议号继续扫描） */
+     private var speedProtocolId: Int? = null
+ 
++    /**
++     * 1.62：巡航红绿灯 AIDL 泛化深扫的来源协议号。
++     * 实车反馈：巡航（非导航）时 60075 广播不推，HUD 红绿灯空白；
++     * 而车机版巡航画面自身有红绿灯倒计时 → 数据走了 AIDL 但 messageType
++     * 不含 TrafficLight（巡航信息类协议）。对策与限速深扫同款：
++     * 任意消息全树扫红绿灯特异键（status/red/green），首次命中锁定协议号，
++     * 之后只扫该协议，避免每条消息全树遍历。
++     */
++    private var lightScanProtocolId: Int? = null
++
+     // 1.38 红绿灯相位交替推断：上一条倒数值 / 时间 / 当前判定灯色（1红 2绿）
+     private var prevLightSec = -1
++    // 1.76：仅有通用倒数（巡航 60075 的 remain，无 status/红绿倒数键）时的
++    // 相位推断状态——1 红 2 绿（HUD 色约定）、上次倒数、上次时间
++    private var remainPhaseGuess = 0
++    private var prevRemainOnlySec = -1
++    private var prevRemainOnlyAtMs = 0L
++    // 1.78：多方向倒数锁定——高德巡航界面同屏显示 2-3 个倒数（不同方向 /
++    // 灯组），extras 列表取错位会让 HUD 数字跳变或显示别家灯组的倒数。
++    // 按「每秒递减」的连续性特征锁定本车当前灯组：上一锁定值 -1（或同值
++    // 重复推送）者延续锁定；锁定断链（相位切换数值跳变）时按同索引位跟随
++    // （同一灯组在列表中位置不变），超过 20 秒没锁到（过路口、灯组换页）
++    // 重新从首值起锁。
++    private var lockListIdx = -1
++    private var lockListSec = -1
++    private var lockListAtMs = 0L
+     private var prevLightAtMs = 0L
+     private var altLightColor = -1
+ 
+@@ -354,14 +378,33 @@
+      * 车机版真实数据源是这条广播（反编译 wh0.c 组装代码证实字段名）。
+      * 复用 parseTrafficLight 的判定/去抖/诊断逻辑。
+      */
+-    fun feedLightBroadcast(status: Int, red: Int, green: Int, dir: Int, waitRound: Int = -1, srcType: Int = 0) {
++    fun feedLightBroadcast(
++        status: Int, red: Int, green: Int, dir: Int, waitRound: Int = -1,
++        srcType: Int = 0, remain: Int = -1, remainList: List<Int> = emptyList()
++    ) {
++        // 1.64：全空 extras（st/r/g/dir/wr 全 -1）直接忽略——实车确认巡航时
++        // 60075 广播照发但 extras 无有效红绿灯键，之前每次都进解析并被当成
++        // 「无红绿灯」触发清空判定，把已有的分行数据冲掉。
++        if (status < 0 && red < 0 && green < 0 && dir < 0 && waitRound < 0 &&
++            remain < 0 && remainList.isEmpty()
++        ) return
++        // 1.79：waitRound（等待轮数）来自发送端 wh0.c 确认语义——红灯等待时
++        // >0。状态键缺失（华阳车机层换键形态）时用它兜底判红。
++        val effStatus = if (status < 1 && waitRound > 0) 1 else status
+         try {
+             val d = JSONObject()
+-            d.put("trafficLightStatus", status)
++            d.put("trafficLightStatus", effStatus)
+             if (red >= 0) d.put("redLightCountDownSeconds", red)
+             if (green >= 0) d.put("greenLastSecond", green)
+             if (dir >= 0) d.put("dir", dir)
+             if (waitRound >= 0) d.put("waitRound", waitRound)
++            // 1.69：诊断行完整 extras 透出实车真实键名——
++            // EXTRA_TRAFFIC_LIGHT_REMAIN_SECONDS=30（当前相位剩余秒）与
++            // EXTRA_TRAFFIC_LIGHT_COUNTDOWNSECONDS=30。作为通用倒数接入。
++            // 1.76：巡航显示多方向倒数（如 左转41/直行36），extras 若为
++            // 整型数组，全列表交给解析层按连续性锁定本车当前灯组（1.78）。
++            if (remain >= 0) d.put("countDown", remain)
++            if (remainList.isNotEmpty()) d.put("countDownList", remainList.joinToString(","))
+             if (parseTrafficLight(d, "Broadcast$srcType")) publish()
+         } catch (_: Throwable) {
+         }
+@@ -432,6 +475,33 @@
+             }
+         }
+ 
++        // 1.62：巡航红绿灯 AIDL 泛化深扫。巡航模式下高德不一定发 60075 广播，
++        // 红绿灯数据可能混在巡航信息协议里（messageType 不含 TrafficLight），
++        // 顶层键检查（parseTrafficLight 的 byKey 门）看不到嵌套字段。
++        // 对所有「非红绿灯类型」消息全树扫特异键；命中 status/red/green 才算
++        // 红绿灯消息（dir/countDown 单独出现不触发，太泛），首次命中锁定
++        // 来源协议号，后续只扫该协议。
++        if (!lightMsg && !hasDirectLightKey &&
++            (lightScanProtocolId == null || lightScanProtocolId == protocolId)
++        ) {
++            val lf = HashMap<String, Int>()
++            deepScanLight(root, lf, 0)
++            if (lf.containsKey("status") || lf.containsKey("red") || lf.containsKey("green")) {
++                lightScanProtocolId = protocolId
++                try {
++                    val synth = JSONObject()
++                    lf["status"]?.let { synth.put("trafficLightStatus", it) }
++                    lf["red"]?.let { synth.put("redLightCountDownSeconds", it) }
++                    lf["green"]?.let { synth.put("greenLightLastSecond", it) }
++                    lf["gen"]?.let { synth.put("countDown", it) }
++                    lf["dir"]?.let { synth.put("dir", it) }
++                    Log.i(TAG, "巡航红绿灯深扫命中：protocolId=$protocolId $lf")
++                    if (parseTrafficLight(synth, "AIDL${protocolId}巡航", "◆深扫=$lf")) changed = true
++                } catch (_: Throwable) {
++                }
++            }
++        }
++
+         if (changed) {
+             state = state.copy(lastUpdateMs = System.currentTimeMillis(), connected = true)
+             publish()
+@@ -620,6 +690,8 @@
+      * 1.51 实拍修正：这台车机 13012 广播 b=31 的车道，高德车道条实际显示
+      * 「掉头+左转」（同帧 b=0=直行、b=4=直+右 均与图一致）——说明实车
+      * 图标表 30+ 段与手头对照图存在版本差异，31 不是图上的「直+左」。
++     * 1.66 实拍修正：b=28 同为「掉头+左转」（推荐车道蓝色左+掉头同框
++     * 确认），对照图的「可变直」不成立；13 暂无反证保留。
+      * 以实车画面为准修正 31；其余双色段值遇到不符时按诊断行 b= 原始值
+      * 继续逐个实拍校准。
+      */
+@@ -633,16 +705,69 @@
+         6, 21, 34, 35 -> 0x2 or 0x4
+         7, 22, 36, 37, 38 -> 0x1 or 0x2 or 0x4
+         9, 10, 24, 25, 39, 40, 41, 42 -> 0x1 or 0x10
++        // 1.66/1.67 实拍修正：b=28 高德车道条实际显示「直行+左转+掉头」
++        // 三箭头（白色直行主体 + 深蓝左转 + 深蓝掉头，同框诊断行
++        // Back_icon=28 确认）——与 1.51 的 b=31 同类版本差异，对照图上
++        // 28 是「可变直」，实车不是。13 无实拍反证，暂保留「可变直」。
++        28 -> 0x1 or 0x2 or 0x10
+         11, 26, 31, 43, 44, 48 -> 0x2 or 0x10
+         12, 27, 45, 46 -> 0x4 or 0x10
+-        13, 28 -> 0x1
++        // 1.67：28 移至上方「直左掉」分支；13 无实拍反证保留「可变直」。
++        13 -> 0x1
+         14, 29, 47 -> 0x2 or 0x10
+         // 1.61 实拍修正：b=57 高德显示「掉头+右转」（诊断行 Back_icon=57
+         // 与高德车道条同框确认）。50-56、58+ 暂无实拍样本，落到兜底。
++        // 1.69/1.70 实拍修正：b=62 高德车道条实际显示「直行+左转+掉头」
++        // 三箭头（白色直行主体 + 深蓝掉头 + 深蓝左转，同框确认）——
++        // 1.69 读成「掉头+左转」漏了直行主体，与 b=28 同构。
+         57 -> 0x4 or 0x10
++        62 -> 0x1 or 0x2 or 0x10
++        // 1.75 实拍修正：b=74 高德车道牌显示「掉头+左转」（左转箭头带
++        // 掉头回勾，与车道牌同框确认）。64+ 段其余值暂无实拍样本，落到兜底。
++        74 -> 0x2 or 0x10
+         else -> -1
+     }
+ 
++    /** 1.70：方向掩码诊断缩写（直=↑ 左=← 右=→ 掉头=U） */
++    private fun maskToDbg(m: Int): String {
++        if (m <= 0) return "无"
++        val s = buildString {
++            if (m and 0x1 != 0) append("直")
++            if (m and 0x2 != 0) append("左")
++            if (m and 0x4 != 0) append("右")
++            if (m and 0x10 != 0) append("掉")
++            if (m and 0x8 != 0) append("稍左")
++            if (m and 0x20 != 0) append("稍右")
++        }
++        return if (s.isEmpty()) "0x" + Integer.toHexString(m) else s
++    }
++
++    /**
++     * 1.73：文字方向扫描——车道对象里任何短字符串值若含「直/左/右/掉/调」
++     * 字样，按字符合成方向掩码。只看值不看键名，限短字符串防误伤。
++     * 1.74 定位：该字段是车道属性描述（如「掉头」）而非完整指引——实拍
++     * b=17（直+左，与高德一致）同帧文=掉，若优先采用会把左车道画成纯掉头。
++     * 因此只作兜底源：位图/枚举/类型都无有效方向时（如 b 值未映射段）启用，
++     * 防止落直行兜底。
++     */
++    private fun textDirMask(o: JSONObject): Int {
++        var m = 0
++        try {
++            for (k in o.keys()) {
++                val v = o.opt(k) as? String ?: continue
++                if (v.isEmpty() || v.length > 16 || v == "null") continue
++                var t = 0
++                if ('直' in v) t = t or 0x1
++                if ('左' in v) t = t or 0x2
++                if ('右' in v) t = t or 0x4
++                if ('掉' in v || '调' in v) t = t or 0x10
++                if (t != 0) m = m or t
++            }
++        } catch (_: Throwable) {
++        }
++        return m
++    }
++
+     /**
+      * 1.39：车道类型值的字符码形态（AMapLaneInfo.getLaneTypeIdArray）：
+      * '0'-'9' 同数字，'A'=10 直+右掉头，'B'=11 左+左掉头，'C'=12 右+右掉头，
+@@ -729,15 +854,18 @@
+ 
+         val lanes = ArrayList<HudLane>(arr.length())
+         val rawTypes = ArrayList<String>(arr.length())
++        val noDirFlags = ArrayList<Boolean>(arr.length())
+         var firstLaneDump = ""
+         for (i in 0 until minOf(arr.length(), 8)) {
+             val o = arr.optJSONObject(i) ?: continue
+ 
+             // 1.39：首条车道对象的完整键值对进诊断行——「全直行」这类问题
+             // 多半是字段名或取值形态与预期不符，一张照片即可定位
++            // 1.73：键数 10→18、值截断 60 字符——文字方向字段可能在后段
+             if (i == 0) {
+-                firstLaneDump = o.keys().asSequence().take(10).joinToString(" ") { k ->
+-                    "$k=${o.opt(k)}"
++                firstLaneDump = o.keys().asSequence().take(18).joinToString(" ") { k ->
++                    val v = o.opt(k).toString().take(60)
++                    "$k=$v"
+                 }
+             }
+ 
+@@ -763,7 +891,17 @@
+             )
+             rawTypes.add("b=$backRaw/t=$typeRaw/i=$iconRaw/e=$extRaw")
+ 
+-            val iconMask = backRaw?.takeIf { it != 255 }?.let { lanePdfToMask(it) } ?: 0
++            val txtMask = textDirMask(o)
++            if (txtMask > 0) rawTypes[rawTypes.size - 1] += "/文=${maskToDbg(txtMask)}"
++
++            // 1.73：未映射位图值（50-56、58-61、63+ 等无实拍样本段）
++            // 不再参与方向取值，避免 -1 混入
++            val backMapped = backRaw != null && backRaw != 255 && lanePdfToMask(backRaw) >= 0
++            val iconMask = if (backMapped) lanePdfToMask(backRaw!!) else 0
++            if (backRaw != null && backRaw != 255 && !backMapped) {
++                rawTypes[rawTypes.size - 1] += "/b未映射"
++            }
++
+             val typeMask = typeRaw?.takeIf { it != 0 }?.let { laneTypeToMask(it) } ?: 0
+             val extMask = extRaw?.takeIf { it != 0 }?.let { laneTypeToMask(it) } ?: 0
+             // 1.50：次选 trafficLaneIcon——它可能是位图索引也可能是 LaneAction
+@@ -779,6 +917,11 @@
+                 enumMask > 0 -> enumMask
+                 typeMask > 0 -> typeMask
+                 extMask > 0 -> extMask
++                // 1.74：文字方向降为兜底——1.73 实拍证实文字字段（如「掉头」）
++                // 是车道属性描述而非完整指引：b=17（直+左，与高德一致）同帧
++                // 文=掉，文字抢优先级会把左车道画成纯掉头。位图/枚举/类型
++                // 都没有有效方向时才用文字，避免未映射 b 值落直行。
++                txtMask > 0 -> txtMask
+                 // 未知取值兜底：枚举/位标志字段直接按位标志解释
+                 // （1直 2左 4右 8稍左 0x10掉头 0x20稍右）；
+                 // 1.50：backRaw 是位图索引（如 16=左转），不能当位标志，已移出兜底
+@@ -788,9 +931,39 @@
+                 else -> 0x1
+             }
+             lanes.add(HudLane(dirs, advised, number, backRaw ?: iconRaw ?: 0))
++            // 1.70：诊断行同时透出解析结果——「b=62→直左掉」一张照片即可
++            // 同时看到原始值和当前映射，不用再交叉对比高德车道条猜
++            rawTypes[rawTypes.size - 1] += "→${maskToDbg(dirs)}"
++            // 1.72：记录「无方向信息」车道——方向字段全缺失/为 0，dirs 是
++            // 兜底直行而非高德真实意图。注意 b=0（键存在且为 0，
++            // lane_pdf_0=直行）是真实直行，不算缺失。
++            // 1.73：位图值未映射（lanePdfToMask=-1）同样视为无可靠方向，
++            // 纳入防降级保护，不再默默画成直行。
++            noDirFlags.add(
++                dirs == 0x1 && txtMask == 0 &&
++                    (backRaw == null || (backRaw != 255 && !backMapped)) &&
++                    (iconRaw ?: 0) == 0 && (typeRaw ?: 0) == 0
++            )
+         }
+         if (lanes.isEmpty()) return false
+ 
++        // 1.72：防降级合并——实拍证实通道会在「详细形态」（如 b=62→直左掉）
++        // 与「无方向简化形态」（方向字段全缺失→兜底纯直行）之间翻转，
++        // 简化推送把好的车道指引冲成全直行（HUD 左车道错显直行的真凶）。
++        // 新推送与当前车道数一致、当前数据新鲜(<30s)时：无方向信息的
++        // 车道保留当前同位车道方向，其余照常更新（advised / number 跟随）。
++        var protectedCount = 0
++        if (noDirFlags.contains(true) && state.lanes.isNotEmpty() &&
++            state.lanes.size == lanes.size && now - state.lanesAtMs < 30_000L
++        ) {
++            for (i in lanes.indices) {
++                if (noDirFlags[i] && lanes[i].directions == 0x1 && state.lanes[i].directions != 0x1) {
++                    lanes[i] = lanes[i].copy(directions = state.lanes[i].directions)
++                    protectedCount++
++                }
++            }
++        }
++
+         // 全局去重（1.23：从「仅相邻」加强）：高德偶发重复条目是车道重叠的来源之一；
+         // 真实的同方向多车道 advised / number 至少有一项不同，不会被误合并
+         val deduped = ArrayList<HudLane>(lanes.size)
+@@ -811,7 +984,7 @@
+             state = state.copy(laneMsgAtMs = now)
+             // 1.45：诊断行每条车道消息都刷新（之前早退不更新，
+             // 拍诊断行时车道原始值经常是空的，无法校准）
+-            laneDbg = "车道type=[${rawTypes.joinToString(",")}] 首条={$firstLaneDump}"
++            laneDbg = laneDbgLine(fromBcast, rawTypes, firstLaneDump, protectedCount)
+             return true
+         }
+ 
+@@ -822,11 +995,18 @@
+             lanesAtMs = now,
+             laneMsgAtMs = now
+         )
+-        Log.i(TAG, "车道更新：${deduped.size} 条（去重前 ${lanes.size}），推荐 $advisedCount 条")
+-        laneDbg = "车道type=[${rawTypes.joinToString(",")}] 首条={$firstLaneDump}"
++        Log.i(TAG, "车道更新：${deduped.size} 条（去重前 ${lanes.size}），推荐 $advisedCount 条" +
++            if (protectedCount > 0) "（防降级保留 $protectedCount 条）" else "")
++        laneDbg = laneDbgLine(fromBcast, rawTypes, firstLaneDump, protectedCount)
+         return true
+     }
+ 
++    /** 1.72：诊断行车道行统一拼装（含防降级标记）。 */
++    private fun laneDbgLine(fromBcast: Boolean, rawTypes: ArrayList<String>, firstLaneDump: String, protectedCount: Int): String =
++        "车道(${if (fromBcast) "广播13012" else "AIDL"})type=[${rawTypes.joinToString(",")}]" +
++            (if (protectedCount > 0) "防降级x$protectedCount " else "") +
++            "首条={$firstLaneDump}"
++
+     /** 1.31/1.39：转向 / 车道 / 红绿灯原始值分路记录（主界面诊断行显示用）。 */
+     private var turnDbg: String = ""
+     private var laneDbg: String = ""
+@@ -835,6 +1015,9 @@
+     /** 1.46：广播通道滚动记录（GaodeWatcher 写入，主界面诊断行显示）。 */
+     var bcastDbg: String = ""
+ 
++    /** 1.64：红绿灯类广播的完整 extras（GaodeWatcher 侧透出，诊断行显示） */
++    var lightExtrasDbg: String = ""
++
+     /** 1.53：限速来源诊断（广播 / 深扫命中时记录键值，供实拍校准） */
+     var speedDbg: String = ""
+ 
+@@ -842,15 +1025,36 @@
+      * 1.53：限速解析入口——命中限速键（数值 km/h）就更新状态。
+      * 返回 true 表示状态有变化需要发布。
+      */
++    /** 1.77：限速上一值来源通道（广播/AIDL），双通道交叉校验用 */
++    private var lastSpeedSrc = ""
++
+     fun feedSpeedLimit(value: Int, src: String): Boolean {
+         if (value <= 0 || value > 200) return false
+         if (value == state.speedLimit) {
+             speedDbg = "限速[$src]=$value"
++            lastSpeedSrc = src
+             return false
+         }
+-        state = state.copy(speedLimit = value, speedLimitAtMs = System.currentTimeMillis())
+-        speedDbg = "限速[$src]=$value"
+-        Log.i(TAG, "限速更新：$value km/h（来源 $src）")
++        var v = value
++        var note = ""
++        // 1.77：双通道交叉校验——广播与 AIDL 两路若一路发 km/h、一路发
++        // m/s（数值恰差 3.6 倍），会来回覆盖跳变。跨通道且差 3.6 倍时
++        // 自动换算统一为 km/h；同通道变化是真实限速区切换，不做换算。
++        val sameChannel = (src.startsWith("广播") && lastSpeedSrc.startsWith("广播")) ||
++            (src.startsWith("AIDL") && lastSpeedSrc.startsWith("AIDL"))
++        val cur = state.speedLimit
++        if (!sameChannel && cur in 5..200) {
++            if (Math.abs(v * 3.6f - cur) <= 3f) {
++                v = Math.round(v * 3.6f)
++                note = "（$value m/s→$v km/h）"
++            } else if (Math.abs(cur * 3.6f - v) <= 11f) {
++                note = "（旧值实为 m/s，已按 $v km/h 修正）"
++            }
++        }
++        state = state.copy(speedLimit = v, speedLimitAtMs = System.currentTimeMillis())
++        speedDbg = "限速[$src]=$v${if (lastSpeedSrc.isNotEmpty()) "（上源:$lastSpeedSrc=$cur）" else ""}$note"
++        lastSpeedSrc = src
++        Log.i(TAG, "限速更新：$v km/h（来源 $src$note）")
+         publish()
+         return true
+     }
+@@ -920,10 +1124,17 @@
+                         }
+                         if (n != Int.MIN_VALUE) {
+                             when {
+-                                kl == "trafficlightstatus" || kl == "lightstatus" -> found["status"] = n
++                                // 1.64：status 放宽为包含匹配（lightStatusEx 等变体）
++                                kl.contains("lightstatus") -> found["status"] = n
+                                 kl.contains("redlightcountdown") || kl.contains("redcountdown") -> found["red"] = n
+-                                kl.contains("greenlastsecond") || kl.contains("greenlightlast") || kl.contains("greenlightcountdown") -> found["green"] = n
+-                                kl == "countdown" || kl == "lightcountdown" -> found["gen"] = n
++                                kl.contains("greenlastsecond") || kl.contains("greenlightlast") ||
++                                    kl.contains("greenlightcountdown") -> found["green"] = n
++                                // 1.64：秒数键放宽——lightSecond/lightTime/lightRemain/
++                                // 任意 *countdown 后缀（redCountdown/lightCountdown/
++                                // trafficLightCountdown 等巡航版可能的变体命名）
++                                kl.endsWith("countdown") ||
++                                    kl.contains("lightsecond") || kl.contains("lighttime") ||
++                                    kl.contains("lightremain") -> found["gen"] = n
+                                 kl == "dir" && !found.containsKey("dir") -> found["dir"] = n
+                             }
+                         }
+@@ -958,7 +1169,8 @@
+         get() = listOf(
+             laneDbg, turnDbg, lightDbg,
+             if (bcastDbg.isNotEmpty()) "广播类型=$bcastDbg" else "",
+-            if (speedDbg.isNotEmpty()) speedDbg else ""
++            if (speedDbg.isNotEmpty()) speedDbg else "",
++            if (lightExtrasDbg.isNotEmpty()) lightExtrasDbg else ""
+         )
+             .filter { it.isNotEmpty() }
+             .joinToString("\n")
+@@ -974,16 +1186,53 @@
+         else -> "其他"
+     }
+ 
++    /**
++     * 1.78：从多方向倒数列表中选出「本车当前灯组」的值。
++     * 规则（按优先级）：
++     * 1) 延续锁定：列表中存在 = 上一锁定值-1（递减一秒）或 = 上一锁定值
++     *    （同秒重复推送）的元素 → 锁定它，数字保证逐秒平滑递减；
++     * 2) 断链同索引：锁定的值从列表消失（相位切换、数值跳变）→ 取列表中
++     *    同一索引位的值（同一灯组位置不变），20 秒内有效；
++     * 3) 重新起锁：超 20 秒没锁到（过路口灯组换页）或首次 → 取首值。
++     * 返回 Pair(选中值, 是否延续锁定) 供诊断行标注。
++     */
++    private fun selectLockedRemain(list: List<Int>): Pair<Int, Boolean> {
++        val cands = list.filter { it > 0 }
++        if (cands.isEmpty()) return Pair(-1, false)
++        val nowMs = System.currentTimeMillis()
++        val fresh = nowMs - lockListAtMs < 20_000L
++        if (lockListSec >= 0 && fresh) {
++            val contIdx = cands.indexOfFirst { it == lockListSec - 1 || it == lockListSec }
++            if (contIdx >= 0) {
++                lockListIdx = contIdx
++                lockListSec = cands[contIdx]
++                lockListAtMs = nowMs
++                return Pair(lockListSec, true)
++            }
++            if (lockListIdx in cands.indices) {
++                lockListSec = cands[lockListIdx]
++                lockListAtMs = nowMs
++                return Pair(lockListSec, false)
++            }
++        }
++        // 首次 / 过期：从首值起锁
++        lockListIdx = 0
++        lockListSec = cands.first()
++        lockListAtMs = nowMs
++        return Pair(lockListSec, false)
++    }
++
+     /** 红绿灯倒数：兼容多个字段命名 */
+     private fun parseTrafficLight(d: JSONObject, messageType: String = "", rawDump: String = ""): Boolean {
+         // 1.34：只有确实带红绿灯字段的消息才处理。
+         // 之前车道（30424）、引导（30407）、广播车道 JSON 也都会走到这里，
+         // 它们不含红绿灯键 → 解析出 status=-1 → 被当成「无红绿灯」立即清空，
+         // 随后的红绿灯协议又写回来，两条协议高频交替 = HUD 上红灯反复闪烁。
+-        val byType = messageType.contains("TrafficLight", true)
++        val byType = messageType.contains("TrafficLight", true) ||
++            messageType.contains("巡航", true)
+         val byKey = d.has("trafficLights") || d.has("trafficLightStatus") ||
+             d.has("redLightCountDownSeconds") || d.has("greenLightLastSecond") ||
+-            d.has("countDown") ||
++            d.has("countDown") || d.has("waitRound") ||
+             d.keys().asSequence().any { k ->
+                 k.contains("light", true) || k.contains("countdown", true)
+             }
+@@ -1020,15 +1269,52 @@
+         val greenSec = pickOptInt(
+             lightSrc, "greenLastSecond", "greenLightLastSecond", "greenLightCountdown", "greenCountDown"
+         ) ?: pickOptInt(d, "greenLastSecond", "greenLightLastSecond")
+-        val genSec = pickOptInt(lightSrc, "countDown") ?: pickOptInt(d, "countDown")
++        var genSec = pickOptInt(lightSrc, "countDown") ?: pickOptInt(d, "countDown")
++        // 1.78：多方向倒数列表——不再固定取首值，按连续性锁定当前灯组
++        // （每秒递减的特征值），锁定断链时同索引跟随。列表存在时覆盖
++        // 单值 countDown，保证 HUD 显示的是本车当前灯组的倒数。
++        var listLocked = false
++        val remainList = (pickStr(lightSrc, "countDownList") ?: pickStr(d, "countDownList"))
++            ?.split(",")?.mapNotNull { it.trim().toIntOrNull() } ?: emptyList()
++        if (remainList.isNotEmpty()) {
++            val sel = selectLockedRemain(remainList)
++            if (sel.first > 0) {
++                genSec = sel.first
++                listLocked = sel.second
++            }
++        }
++        // 1.65：绿灯秒数「恒 3 标志」检测——实车确认这版车机绿灯期间
++        // greenLastSecond 固定发 3（绿灯尾提示标志），只在真正剩 3 秒内才
++        // 递减 3→2→1。连续两条同值（不递减）即判定为标志值，不能当剩余
++        // 秒数显示（否则绿灯全程假"3"常亮），也不能触发黄灯尾判定。
++        val greenStuck = greenSec != null && greenSec > 0 && greenSec == prevGreenSec
+         // 秒数 = 当前相位剩余秒（redLightCountDownSeconds 各相位都带值，
+         // 与 AMap Companion secondsForLight 一致）
+         seconds = listOfNotNull(redSec, genSec, greenSec).filter { it > 0 }.maxOrNull() ?: -1
+ 
+-        // 1.49：灯色判定照搬 AMap Companion colorForStatus 实测逻辑
+-        status = when {
+-            // 黄灯尾：绿灯只剩 3 秒以内（green==3 且无红倒数，或 1-2 秒）
+-            ((greenSec ?: -1) == 3 && (redSec ?: -1) <= 0) || (greenSec ?: 0) in 1..2 -> 3
++        // 1.76：仅有通用倒数（countDown / EXTRA_TRAFFIC_LIGHT_REMAIN_SECONDS，
++        // 无 status / 红绿倒数键）时——巡航版 60075 的典型形态——做相位推断：
++        // 沿用上一判定灯色，倒数跳升（新相位开始）红绿互换。之前这条路径
++        // 落「黄灯」兜底，巡航灯色错且与倒数脱节。
++        val remainOnly = explicit < 1 && redSec == null && greenSec == null && (genSec ?: -1) > 0
++        status = if (remainOnly) {
++            val nowMs = System.currentTimeMillis()
++            if (prevRemainOnlyAtMs > 0 && nowMs - prevRemainOnlyAtMs < 120_000L &&
++                prevRemainOnlySec >= 0 && genSec!! > prevRemainOnlySec + 2
++            ) {
++                // 相位交替：新倒数比上一次明显大 → 新相位开始，红绿互换
++                remainPhaseGuess = if (remainPhaseGuess == 1) 2 else 1
++            } else if (remainPhaseGuess == 0) {
++                remainPhaseGuess = if (state.lightStatus == 2) 2 else 1
++            }
++            prevRemainOnlySec = genSec!!
++            prevRemainOnlyAtMs = nowMs
++            remainPhaseGuess
++        } else when {
++            // 黄灯尾：绿灯只剩 3 秒以内（green==3 且无红倒数，或 1-2 秒）；
++            // 1.65：greenStuck（恒 3 标志）不算绿灯尾
++            !greenStuck &&
++                (((greenSec ?: -1) == 3 && (redSec ?: -1) <= 0) || (greenSec ?: 0) in 1..2) -> 3
+             statusRaw == 0 || statusRaw == 2 || statusRaw == 3 || statusRaw == 5 || statusRaw == 6 -> 3
+             statusRaw == 4 -> 2
+             statusRaw == 1 -> 1
+@@ -1040,11 +1326,20 @@
+         // 绿灯倒数（firstOrNull 按优先级顺序取第一个有效值，不再取最大值；
+         // 实拍 1.37 证实绿灯时 redLightCountDownSeconds 也可能带更大残留值，
+         // 取最大会显示错秒）。gen=countDown 通用倒数作次选。
+-        seconds = when (status) {
++        // 1.65：greenStuck 时排除绿灯假 3，改用红倒数/通用倒数；绿灯期间
++        // 都没有真秒数时显示不带数字的绿灯（画层支持 seconds<0 隐藏数字）。
++        seconds = if (remainOnly) genSec!! else when (status) {
+             1 -> listOfNotNull(redSec, genSec, greenSec).filter { it > 0 }.firstOrNull() ?: -1
+-            2, 3 -> listOfNotNull(greenSec, genSec, redSec).filter { it > 0 }.firstOrNull() ?: -1
++            2, 3 -> {
++                val g = if (greenStuck) null else greenSec
++                val v = listOfNotNull(g, genSec, redSec).filter { it > 0 }.firstOrNull() ?: -1
++                if (v < 0 && status == 2) -1 else v
++            }
+             else -> listOfNotNull(redSec, genSec, greenSec).filter { it > 0 }.firstOrNull() ?: -1
+         }
++        // 1.65：维护递减检测基准（1.47 的遗留字段此前从未更新）
++        prevGreenSec = greenSec ?: 0
++        prevRedSec = redSec ?: 0
+         prevLightSec = seconds
+         prevLightAtMs = System.currentTimeMillis()
+ 
+@@ -1067,17 +1362,37 @@
+         } else {
+             messageType.take(12)
+         }
++        // 1.76：多方向倒数列表透出（巡航分组倒计时的数组形态）
++        // 1.78：锁定标记——「列表=41,36 锁36」表示当前灯组锁定在 36
++        val listDump = pickStr(lightSrc, "countDownList")
+         lightDbg = "红绿灯[$srcLabel]" +
+             (if (rawDump.isNotEmpty()) "原始=$rawDump → " else "") +
++            (if (listDump != null) "列表=$listDump${if (listLocked) " 锁$genSec" else ""} " else "") +
+             "st=$explicit r=$redSec g=$greenSec gen=$genSec dir=${pickOptInt(lightSrc, "dir") ?: -1} " +
+             "wr=${pickOptInt(lightSrc, "waitRound") ?: -1} → 判定=${if (status in 1..3) status else "无"}"
+ 
+         // 有效状态（1 红 / 2 绿 / 3 黄）
+-        if (status > 0) {
+-            // 秒数缺失时沿用上一次的值（高德有时只发状态不发倒数），
+-            // 不要落成 -1 / 0，否则画面会跳一下
+-            val sec = if (seconds >= 0) seconds else state.lightSeconds.coerceAtLeast(0)
+-            val effMask = if (dirMask != 0) dirMask else lightMask
++        if (status > 0) {            // 秒数缺失时沿用上一次的值（高德有时只发状态不发倒数），
++            // 不要落成 -1 / 0，否则画面会跳一下。
++            // 1.65：绿灯例外——绿灯期间没有真秒数（greenLastSecond 恒 3
++            // 标志、红倒数/通用倒数也无）时不沿用红灯尾的残留值（沿用会
++            // 显示「绿 1」之类的假倒数），落 -1 让画层只画绿灯不画数字。
++            val sec = when {
++                seconds >= 0 -> seconds
++                status == 2 -> -1
++                else -> state.lightSeconds.coerceAtLeast(0)
++            }
++            // 1.65：圈内箭头方向三级兜底——dir（60075 原生，巡航版恒 -1）
++            // > lightIcon > 推荐车道方向（本车拟行方向 ≈ 推荐车道方向，
++            // 高德车道指引的 advised 车道就是当前要走的道）。之前无 dir
++            // 一律画直行箭头，左拐 / 掉头路口全部错显直行。
++            val advisedMask = state.lanes.firstOrNull { it.advised }?.directions ?: 0
++            val effMask = when {
++                dirMask != 0 -> dirMask
++                lightMask != 0 -> lightMask
++                advisedMask != 0 -> advisedMask
++                else -> 0
++            }
+             // 1.60：按行驶方向分行记录（巡航两行显示：直行一行、左转一行）。
+             // 同一路口不同 dir 的 60075 / AIDL 消息各更新各自一行，60 秒
+             // 没刷新的方向行自动剔除。
+@@ -1104,6 +1419,9 @@
+             val age = System.currentTimeMillis() - state.lightAtMs
+             if (age < 1200L) return false
+             lightRows.clear()
++            // 1.78：灯组清空（过路口）时同步释放倒数锁定，下一路口重新起锁
++            lockListIdx = -1
++            lockListSec = -1
+             state = state.copy(
+                 lightStatus = -1,
+                 lightSeconds = -1,
+diff -ru /tmp/prev_src/hud-cast/app/src/main/java/cn/hud/cast/CardEditorView.kt /workspace/hud-cast/app/src/main/java/cn/hud/cast/CardEditorView.kt
+--- /tmp/prev_src/hud-cast/app/src/main/java/cn/hud/cast/CardEditorView.kt	2026-11-11 06:32:40.000000000 +0800
++++ /workspace/hud-cast/app/src/main/java/cn/hud/cast/CardEditorView.kt	2026-11-11 07:20:54.690871000 +0800
+@@ -12,7 +12,7 @@
+  *
+  * 交互（只在 [editingEnabled] 打开时接管手势）：
+  *   · 单指按住某元素拖动 → 移动该元素（超出画面自动夹住）
+- *   · 双指捏合          → 缩放当前选中元素（0.4x ~ 3.0x）
++ *   · 双指捏合          → 缩放当前选中元素（0.1x ~ 3.0x）
+  *   · 点空白处          → 取消选择
+  *
+  * 编辑态下会向父级申请「禁止拦截触摸」，避免和页面上下滚动抢手势；
+@@ -70,14 +70,14 @@
+     fun scaleSelected(delta: Float) {
+         val sel = selected ?: return
+         val box = editLayout().box(sel)
+-        box.scale = (box.scale * delta).coerceIn(0.4f, 3.0f)
++        box.scale = (box.scale * delta).coerceIn(0.1f, 3.0f)
+         afterChange()
+     }
+ 
+     /** 滑块直接设置的倍数 */
+     fun setSelectedScale(value: Float) {
+         val sel = selected ?: return
+-        editLayout().box(sel).scale = value.coerceIn(0.4f, 3.0f)
++        editLayout().box(sel).scale = value.coerceIn(0.1f, 3.0f)
+         afterChange()
+     }
+ 
+@@ -118,7 +118,7 @@
+                 if (event.pointerCount >= 2 && pinching && selected != null) {
+                     val d = distanceBetween(event)
+                     if (pinchStartDistance > 4f && d > 4f) {
+-                        val target = (pinchStartScale * d / pinchStartDistance).coerceIn(0.4f, 3.0f)
++                        val target = (pinchStartScale * d / pinchStartDistance).coerceIn(0.1f, 3.0f)
+                         editLayout().box(selected!!).scale = target
+                         afterChange()
+                     }
+diff -ru /tmp/prev_src/hud-cast/app/src/main/java/cn/hud/cast/GaodeWatcher.kt /workspace/hud-cast/app/src/main/java/cn/hud/cast/GaodeWatcher.kt
+--- /tmp/prev_src/hud-cast/app/src/main/java/cn/hud/cast/GaodeWatcher.kt	2026-11-11 00:09:00.000000000 +0800
++++ /workspace/hud-cast/app/src/main/java/cn/hud/cast/GaodeWatcher.kt	2026-11-12 05:36:45.572929000 +0800
+@@ -28,7 +28,7 @@
+     /** 1.28：KEY_TYPE=13012 时的车道 JSON 兜底通道（车机版把车道数据放进 EXTRA_DRIVE_WAY） */
+     private val onLaneJson: ((json: String) -> Unit)? = null,
+     /** 1.42/1.47：红绿灯倒数广播（60073/60075，extras 为扁平字段） */
+-    private val onLightExtras: ((status: Int, red: Int, green: Int, dir: Int, waitRound: Int, srcType: Int) -> Unit)? = null,
++    private val onLightExtras: ((status: Int, red: Int, green: Int, dir: Int, waitRound: Int, srcType: Int, remain: Int, remainList: List<Int>) -> Unit)? = null,
+     /** 1.53：限速广播泛化捕获（extras 含 speedLimit/limitSpeed 等键，值 km/h） */
+     private val onSpeedLimit: ((value: Int, srcType: Int) -> Unit)? = null
+ ) {
+@@ -97,6 +97,12 @@
+         lanePollHandler.postDelayed(lanePollTask, 500L)
+     }
+ 
++    /** 1.64：最近一条红绿灯类广播的完整 extras 键值串（诊断行显示）。
++     *  实车确认巡航时 60075 广播照发但 st/r/g/dir/wr 全无效——
++     *  真实键名只能从这里找，一张照片即可校准。 */
++    var lastLightExtrasDump = ""
++        private set
++
+     private fun stopLanePoll() {
+         lanePollRunning = false
+         lanePollHandler.removeCallbacks(lanePollTask)
+@@ -113,9 +119,15 @@
+                 val extraKeys = intent.extras?.keySet()?.joinToString(",") ?: ""
+                 val extraVals = intent.extras?.keySet()?.joinToString(",") { k ->
+                     val v = intent.extras?.get(k)
++                    // 1.76：数组值展开显示——巡航分组倒计时疑似整型数组，
++                    // 之前只显示 "[I" 类型名，一张照片什么都看不到
+                     val s = when (v) {
+                         is Int, is Long, is Boolean, is Float, is Double -> v.toString()
+                         is String -> v
++                        is IntArray -> v.joinToString(",", "[", "]")
++                        is LongArray -> v.joinToString(",", "[", "]")
++                        is ShortArray -> v.joinToString(",", "[", "]")
++                        is Array<*> -> v.joinToString(",", "[", "]")
+                         else -> v?.javaClass?.simpleName ?: "null"
+                     }
+                     "$k=$s"
+@@ -170,26 +182,45 @@
+                         onLaneJson?.invoke(laneJson)
+                     }
+                 }
+-                // 1.42：红绿灯倒数广播。反编译车机版（wh0.c → TrafficLightsCountdownInfo
+-                // 广播组装）证实：KEY_TYPE=60073，extras 为扁平字段——
+-                // trafficLightStatus / dir / redLightCountDownSeconds / waitRound，
+-                // greenLightLastSecond 受版本开关控制可能缺失。
+-                // 用户诊断行「红倒数=null 绿倒数=null → 判定=无」说明 AIDL JSON 通道
+-                // 根本没有红绿灯数据，这条广播才是真实数据源。
+-                if (type == 60073 || type == 60075 || intent.hasExtra("trafficLightStatus") ||
+-                    intent.hasExtra("redLightCountDownSeconds") || intent.hasExtra("greenLastSecond")
+-                ) {
+-                    // 1.47：实车广播类型行定位——这台车机发的是 KEY_TYPE=60075
+-                    //（不是反编译 60073），extras 键名为：
+-                    //   trafficLightStatus / redLightCountDownSeconds /
+-                    //   greenLastSecond（注意不是 greenLightLastSecond）/ waitRound / dir
+-                    val st = pickIntExtra(intent, "trafficLightStatus")
++                // 1.79 逆向定案（高德 9.5.13 dex 全量反编译）：
++                //   · wh0.c（TrafficLightsCountdownInfoDisAction）→ KEY_TYPE=60073，
++                //     extras = trafficLightStatus / dir / redLightCountDownSeconds /
++                //     waitRound / greenLightLastSecond（ib.t() 版本开关，9.5.13 恒发）；
++                //     数据源 = 引擎协议 80189（RspTrafficLightsCountdownInfoModel，单值，
++                //     巡航时引擎只导出"当前灯"那一盏 → HUD 单胶囊显示即正确形态）；
++                //   · yg.c（ControlTouchBeepAction）→ KEY_TYPE=60075 = 按键提示音响应，
++                //     extras 只有 EXTRA_TOUCHBEEPRESULT——实车巡航诊断里那些
++                //     st=-1/r=null 的 60075 空广播就是它，不是红绿灯；
++                //   · 引擎侧巡航倒数有门禁（cruise.param.enable_traffic_light +
++                //     CruiseTrafficLightAuth 云端授权），被禁时不导出 60073——
++                //     这是巡航不显示的最可能根因，属高德侧开关，接收端无法绕过。
++                // 触发条件：60073 恒解析；60075 仅在带红绿灯键时解析（华阳车机层
++                // 可能在 60075 里夹带 EXTRA_TRAFFIC_LIGHT_* 键，保留兼容）。
++                val hasLightKeys = intent.hasExtra("trafficLightStatus") ||
++                    intent.hasExtra("redLightCountDownSeconds") || intent.hasExtra("greenLastSecond") ||
++                    intent.hasExtra("greenLightLastSecond") || intent.hasExtra("waitRound") ||
++                    intent.hasExtra("EXTRA_TRAFFIC_LIGHT_REMAIN_SECONDS") ||
++                    intent.hasExtra("EXTRA_TRAFFIC_LIGHT_COUNTDOWNSECONDS")
++                if (type == 60073 || hasLightKeys) {
++                    // 1.69：诊断行完整 extras 透出——车机层（华阳）若换键名一张照片可定位
++                    val st = pickIntExtra(intent, "trafficLightStatus", "EXTRA_TRAFFIC_LIGHT_STATUS")
+                     val red = pickIntExtra(intent, "redLightCountDownSeconds")
+                     val green = pickIntExtra(intent, "greenLastSecond", "greenLightLastSecond")
+                     val dir = pickIntExtra(intent, "dir")
+                     val wr = pickIntExtra(intent, "waitRound")
+-                    Log.i(TAG, "红绿灯广播(type=$type)：status=$st red=$red green=$green dir=$dir waitRound=$wr")
+-                    onLightExtras?.invoke(st, red, green, dir, wr, type)
++                    val remain = pickIntExtra(
++                        intent,
++                        "EXTRA_TRAFFIC_LIGHT_REMAIN_SECONDS", "EXTRA_TRAFFIC_LIGHT_COUNTDOWNSECONDS"
++                    )
++                    Log.i(TAG, "红绿灯广播(type=$type)：status=$st red=$red green=$green dir=$dir waitRound=$wr remain=$remain")
++                    // 1.64：完整 extras 透出到诊断行（beep 广播已在上方被过滤，不会覆盖）
++                    lastLightExtrasDump = "红绿灯广播$type 完整extras: ${extraVals.take(220)}"
++                    // 1.76：数组形态 extras 全量提取（巡航分组倒计时）
++                    val remainList = pickIntList(
++                        intent,
++                        "EXTRA_TRAFFIC_LIGHT_REMAIN_SECONDS", "EXTRA_TRAFFIC_LIGHT_COUNTDOWNSECONDS"
++                    )
++                    onLightExtras?.invoke(st, red, green, dir, wr, type, remain, remainList)
+                 }
+                 when {
+                     isStart(state) -> {
+@@ -286,7 +317,8 @@
+         return null
+     }
+ 
+-    /** 1.42：读扁平 Int extras（兼容数字字符串形态，缺失返回 -1） */
++    /** 1.42：读扁平 Int extras（兼容数字字符串形态，缺失返回 -1）；
++     *  1.76：extras 为整型/字符串数组时取首个有效元素 */
+     private fun pickIntExtra(intent: Intent, vararg keys: String): Int {
+         for (key in keys) {
+             val v = try {
+@@ -297,6 +329,11 @@
+             val n = when (v) {
+                 is Number -> v.toInt()
+                 is String -> v.toIntOrNull() ?: continue
++                is IntArray -> v.firstOrNull { it >= 0 }?.takeIf { it != Int.MIN_VALUE } ?: continue
++                is LongArray -> v.firstOrNull { it >= 0 }?.toInt() ?: continue
++                is Array<*> -> v.mapNotNull {
++                    (it as? Number)?.toInt() ?: (it as? String)?.toIntOrNull()
++                }.firstOrNull() ?: continue
+                 else -> continue
+             }
+             if (n != -1) return n
+@@ -304,6 +341,30 @@
+         return -1
+     }
+ 
++    /** 1.76：读数组型 extras 的全部整数元素（巡航分组倒计时形态），空返回 emptyList */
++    private fun pickIntList(intent: Intent, vararg keys: String): List<Int> {
++        for (key in keys) {
++            val v = try {
++                intent.extras?.get(key)
++            } catch (_: Throwable) {
++                null
++            } ?: continue
++            val list: List<Int> = when (v) {
++                is IntArray -> v.toList()
++                is LongArray -> v.map { it.toInt() }
++                is ShortArray -> v.map { it.toInt() }
++                is Array<*> -> v.mapNotNull {
++                    (it as? Number)?.toInt() ?: (it as? String)?.toIntOrNull()
++                }
++                is Number -> listOf(v.toInt())
++                is String -> listOfNotNull(v.toIntOrNull())
++                else -> continue
++            }
++            if (list.isNotEmpty()) return list
++        }
++        return emptyList()
++    }
++
+     private fun pickText(intent: Intent, vararg keys: String): String? {
+         for (k in keys) {
+             val v = try {
+diff -ru /tmp/prev_src/hud-cast/app/src/main/java/cn/hud/cast/HudCardView.kt /workspace/hud-cast/app/src/main/java/cn/hud/cast/HudCardView.kt
+--- /tmp/prev_src/hud-cast/app/src/main/java/cn/hud/cast/HudCardView.kt	2026-11-11 06:43:32.000000000 +0800
++++ /workspace/hud-cast/app/src/main/java/cn/hud/cast/HudCardView.kt	2026-11-11 07:56:54.663871000 +0800
+@@ -54,7 +54,7 @@
+                 val cx = v[0].toFloatOrNull() ?: return@map null
+                 val cy = v[1].toFloatOrNull() ?: return@map null
+                 val s = v[2].toFloatOrNull() ?: return@map null
+-                ElementBox(cx.coerceIn(0f, 1f), cy.coerceIn(0f, 1f), s.coerceIn(0.4f, 3f))
++                ElementBox(cx.coerceIn(0f, 1f), cy.coerceIn(0f, 1f), s.coerceIn(0.1f, 3f))
+             }
+             if (boxes.any { it == null }) return d
+             return CardLayout(
+@@ -232,10 +232,17 @@
+         // [cruiseLayout]，在主界面单独编辑。编辑器 demoCruise=true 时
+         // 预览的就是这套巡航布局。
+         if (if (demoMode) demoCruise else !s.navActive) {
+-            // 1.60：巡航红绿灯两行显示（直行一行、左转一行）
+-            drawCruiseLights(canvas, s, alpha, cruiseLayout.light)
+-            drawLanes(canvas, s, alpha, cruiseLayout.lanes)
+-            drawRoad(canvas, s, alpha, cruiseLayout.road)
++            // 1.68：车机高德空闲（既没导航也没巡航）时 60075 红绿灯广播
++            // 照样推送，之前无条件画灯导致等红灯时 HUD 常挂一个红绿灯。
++            // 数据通道空闲（>15 秒没有巡航/导航数据）就只画限速牌，
++            // 红绿灯 / 车道 / 道路名都不画；巡航数据恢复即自动重现。
++            val cruiseActive = demoMode || !stale
++            if (cruiseActive) {
++                // 1.60：巡航红绿灯两行显示（直行一行、左转一行）
++                drawCruiseLights(canvas, s, alpha, cruiseLayout.light)
++                drawLanes(canvas, s, alpha, cruiseLayout.lanes)
++                drawRoad(canvas, s, alpha, cruiseLayout.road)
++            }
+             drawSpeedLimit(canvas, s, alpha, cruiseLayout.speed)
+             if (editMode) drawSelection(canvas, s)
+             canvas.restore()
+@@ -567,12 +574,18 @@
+         status: Int, seconds: Int, dirMask: Int, alpha: Int
+     ) {
+         val r = 24f * scale
+-        // 1.35：应用全局秒数微调偏移，最少显示 1 秒
++        // 1.35：应用全局秒数微调偏移，最少显示 1 秒。
++        // 1.65：seconds<0 = 该灯色没有真实倒数（绿灯期间这版车机不发秒数，
++        // greenLastSecond 恒 3 是标志值）——不画数字，只画灯色圆，避免假"0"。
+         val shownSeconds = if (seconds >= 0) (seconds + lightSecondsOffset).coerceAtLeast(1) else 0
+-        val digits = if (seconds >= 0) shownSeconds.toString() else "0"
++        val digits = if (seconds >= 0) shownSeconds.toString() else ""
+         // 1.33：数字位宽固定按 2 位算。之前按实际位数算宽度，倒数 10→9 时
+         // 胶囊整体收窄、数字重新居中，看起来就像「在闪」。
+-        val digitSlots = if (digits.length < 2) 2 else digits.length
++        val digitSlots = when {
++            digits.isEmpty() -> 0
++            digits.length < 2 -> 2
++            else -> digits.length
++        }
+         // 1.40：倒计时改用阿拉伯数字（普通粗体字体），字高按圆半径定。
+         numberPaint.textSize = r * 1.5f
+         numberPaint.textAlign = Paint.Align.LEFT
+@@ -607,20 +620,23 @@
+         canvas.drawCircle(ringCx, cy, r - stroke.strokeWidth / 2f, stroke)
+ 
+         // 圆心白色实心箭头 = 路口行驶方向（dir 字段，Companion 实测表解析；
+-        // 无方向数据时画直行兜底）。
+-        val lightMask = if (dirMask != 0) dirMask else 0x1
+-        drawSolidArrow(
+-            canvas,
+-            lightMask,
+-            ringCx,
+-            cy - r * 0.8f,
+-            cy + r * 0.8f,
+-            withAlpha(Color.WHITE, alpha),
+-            fitIn = RectF(
+-                ringCx - r * 0.70f, cy - r * 0.70f,
+-                ringCx + r * 0.70f, cy + r * 0.70f
++        // 1.65：无方向数据时不再硬画直行兜底——巡航版 60075 的 dir 恒 -1，
++        // 硬画直行会让左拐 / 掉头路口全部错显直行，改为只画灯色圆。
++        // 数据层已用推荐车道方向兜底，走到这里的 0 是真没有方向信息。）
++        if (dirMask != 0) {
++            drawSolidArrow(
++                canvas,
++                dirMask,
++                ringCx,
++                cy - r * 0.8f,
++                cy + r * 0.8f,
++                withAlpha(Color.WHITE, alpha),
++                fitIn = RectF(
++                    ringCx - r * 0.70f, cy - r * 0.70f,
++                    ringCx + r * 0.70f, cy + r * 0.70f
++                )
+             )
+-        )
++        }
+ 
+         // 右侧倒计时数字（1.40：阿拉伯数字，取代七段数码管）。
+         // 颜色跟随灯色——红灯红数字、绿灯绿数字、黄灯黄数字；
+@@ -633,8 +649,10 @@
+         numberPaint.color = withAlpha(digitColor, alpha)
+         val fm = numberPaint.fontMetrics
+         val baseline = cy - (fm.ascent + fm.descent) / 2f
+-        val numLeft = left + r * 2 + 10f * scale + (digitSlots - digits.length) * digitW
+-        canvas.drawText(digits, numLeft, baseline, numberPaint)
++        if (digits.isNotEmpty()) {
++            val numLeft = left + r * 2 + 10f * scale + (digitSlots - digits.length) * digitW
++            canvas.drawText(digits, numLeft, baseline, numberPaint)
++        }
+         numberPaint.textAlign = Paint.Align.CENTER
+     }
+ 
+@@ -644,13 +662,28 @@
+      * 分行记录；只有一行数据时退化为单胶囊居中。
+      */
+     private fun drawCruiseLights(canvas: Canvas, s: HudCardState, alpha: Int, box: ElementBox) {
+-        val rows = s.cruiseLights.take(2)
++        val now = System.currentTimeMillis()
++        // 1.62：60 秒没刷新的方向行剔除（与数据层快照一致，绘制侧兜底）；
++        // 数据停推时本地倒数——按 atMs 每秒递减到 0，避免高德巡航只推
++        // 一两次后 HUD 数字冻结不动。持续推送时 atMs 每秒刷新，本地递减
++        // 不生效（elapsed<1s），两种节奏都不冲突。
++        val rows = s.cruiseLights
++            .filter { now - it.atMs < 60_000L }
++            .take(2)
++            .map { r ->
++                val el = ((now - r.atMs) / 1000L).toInt()
++                if (r.seconds >= 0 && el > 0) r.copy(seconds = (r.seconds - el).coerceAtLeast(0)) else r
++            }
+         val cx = box.cx * DESIGN_W
+         val cy = box.cy * DESIGN_H
+         if (rows.isEmpty()) {
+             if (s.lightStatus > 0) {
+-                // 没有方向分行数据时退回单胶囊（沿用主状态）
+-                drawLightCapsule(canvas, cx, cy, box.scale, s.lightStatus, s.lightSeconds, s.lightTurnMask, alpha)
++                // 没有方向分行数据时退回单胶囊（沿用主状态，同样本地倒数）
++                val el = if (s.lightAtMs > 0) ((now - s.lightAtMs) / 1000L).toInt() else 0
++                val sec = if (s.lightSeconds >= 0 && el > 0) {
++                    (s.lightSeconds - el).coerceAtLeast(0)
++                } else s.lightSeconds
++                drawLightCapsule(canvas, cx, cy, box.scale, s.lightStatus, sec, s.lightTurnMask, alpha)
+             } else if (editMode) {
+                 placeholder(canvas, lightBounds(), "红绿灯")
+             }
+@@ -662,6 +695,9 @@
+         rows.forEachIndexed { i, row ->
+             drawLightCapsule(canvas, cx, cys[i], box.scale, row.status, row.seconds, row.dirMask, alpha)
+         }
++        // 1.62：本地倒数没有数据层心跳驱动，绘制层自己排「每秒一帧」；
++        // 只有真有红绿灯内容时才排（含单胶囊退路），空数据不空转
++        if (rows.isNotEmpty() || s.lightStatus > 0) postInvalidateDelayed(1000L)
+     }
+ 
+     // 道路名 / 下一步动作
+diff -ru /tmp/prev_src/hud-cast/app/src/main/java/cn/hud/cast/HudCastService.kt /workspace/hud-cast/app/src/main/java/cn/hud/cast/HudCastService.kt
+--- /tmp/prev_src/hud-cast/app/src/main/java/cn/hud/cast/HudCastService.kt	2026-11-11 07:01:36.000000000 +0800
++++ /workspace/hud-cast/app/src/main/java/cn/hud/cast/HudCastService.kt	2026-11-11 12:21:54.434762000 +0800
+@@ -325,10 +325,10 @@
+                         protocol?.feedLaneJson(json)
+                     }
+                 },
+-                onLightExtras = { status, red, green, dir, waitRound, srcType ->
++                onLightExtras = { status, red, green, dir, waitRound, srcType, remain, remainList ->
+                     // 1.47：红绿灯倒数广播（KEY_TYPE=60075，实车广播类型行定位）
+                     if (mode == MODE_CARD) {
+-                        protocol?.feedLightBroadcast(status, red, green, dir, waitRound, srcType)
++                        protocol?.feedLightBroadcast(status, red, green, dir, waitRound, srcType, remain, remainList)
+                     }
+                 },
+                 onSpeedLimit = { value, srcType ->
+@@ -665,7 +665,11 @@
+      */
+     private fun applyCardState(state: HudCardState) {
+         // 1.46：广播通道滚动记录同步到诊断行（60073 未命中时可见车机实际广播类型）
+-        watcher?.let { if (it.lastBcastTypes.isNotEmpty()) protocol?.bcastDbg = it.lastBcastTypes }
++        watcher?.let {
++            if (it.lastBcastTypes.isNotEmpty()) protocol?.bcastDbg = it.lastBcastTypes
++            // 1.64：红绿灯类广播完整 extras 同步到诊断行（巡航键名校准）
++            if (it.lastLightExtrasDump.isNotEmpty()) protocol?.lightExtrasDbg = it.lastLightExtrasDump
++        }
+         // 1.44：引导数据是否有「实际变化」（距离递减 / 转向 / 道路 / 全程信息）。
+         // 行驶中每秒都在变；到达目的地或退出导航后高德停推或重复同一值，
+         // 该时间戳停止前进，看门狗据此识别冻结残留。
+diff -ru /tmp/prev_src/hud-cast/app/src/main/java/cn/hud/cast/MainActivity.kt /workspace/hud-cast/app/src/main/java/cn/hud/cast/MainActivity.kt
+--- /tmp/prev_src/hud-cast/app/src/main/java/cn/hud/cast/MainActivity.kt	2026-11-11 07:00:56.000000000 +0800
++++ /workspace/hud-cast/app/src/main/java/cn/hud/cast/MainActivity.kt	2026-11-11 07:21:05.489871000 +0800
+@@ -418,13 +418,14 @@
+         parent.addView(scaleLabel)
+ 
+         val scaleBar = SeekBar(this).apply {
+-            max = 260
++            // 1.63：缩放范围扩大到 0.1x ~ 3.0x（progress 0..290 → (p+10)/100）
++            max = 290
+             progress = 100
+         }
+         scaleBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+             override fun onProgressChanged(bar: SeekBar?, progress: Int, fromUser: Boolean) {
+                 if (!fromUser) return
+-                val value = (progress + 40) / 100f
++                val value = (progress + 10) / 100f
+                 scaleLabel.text = "选中元素的缩放：%.2fx".format(value)
+                 editor.setSelectedScale(value)
+             }
+@@ -446,7 +447,7 @@
+                 null -> "未选中"
+             }
+             scaleLabel.text = "选中元素的缩放：%.2fx（%s）".format(editor.currentScale(), label)
+-            val p = ((editor.currentScale() - 0.4f) * 100).toInt().coerceIn(0, 260)
++            val p = ((editor.currentScale() - 0.1f) * 100).toInt().coerceIn(0, 290)
+             if (scaleBar.progress != p) scaleBar.progress = p
+         }
+ 

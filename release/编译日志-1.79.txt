@@ -1,0 +1,17 @@
+=== 1. aapt2 link（manifest + 既有编译资源） ===
+=== 2. kotlinc ===
+=== 3. classes.jar ===
+=== 4. d8（含 kotlin-stdlib，min-api 26） ===
+total 2216
+drwxr-xr-x 2 root root    4096 Nov 12 05:37 .
+drwxr-xr-x 4 root root    4096 Nov 12 05:37 ..
+-rw-r--r-- 1 root root 2258252 Nov 12 05:37 classes.dex
+=== 5. 打包 dex ===
+=== 6. zipalign ===
+=== 7. apksigner ===
+Signer #1 certificate DN: CN=HUD Cast, OU=Dev, O=Dev, L=SZ, ST=GD, C=CN
+Signer #1 certificate SHA-256 digest: 30f9550e1992d129b5299e6d665cad3d5fc1d5047f1f0b6953ca8d34f6583c85
+Signer #1 certificate SHA-1 digest: 578bcfb003f4cff2e418556c15c5c7bef7e30a18
+Signer #1 certificate MD5 digest: 774f3155f7136837a3ada175d1d282a0
+=== 完成 ===
+-rw-r--r-- 1 root root 725815 Nov 12 05:37 /workspace/HUD投屏-1.79.apk
