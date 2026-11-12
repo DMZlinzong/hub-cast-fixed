@@ -42,6 +42,12 @@ class MainActivity : Activity() {
         }
     }
 
+    /** 1.82：扫码下载日志区（记录开关按钮 + 二维码 + 备用 URL）。 */
+    private lateinit var recButton: Button
+    private lateinit var qrImage: android.widget.ImageView
+    private lateinit var qrUrlText: TextView
+    private lateinit var qrHint: TextView
+
     private fun updateLogView() {
         if (!this::logText.isInitialized) return
         val lines = try {
@@ -50,7 +56,63 @@ class MainActivity : Activity() {
             emptyList()
         }
         if (lines.isEmpty()) return
-        logText.text = lines.joinToString("\n")
+        val state = "记录:${if (DebugLog.recordingEnabled) "开" else "关"} 缓冲:${DebugLog.memCount()}行"
+        logText.text = "$state\n" + lines.joinToString("\n")
+    }
+
+    /**
+     * 1.82：生成二维码分享日志——内存日志 → UTF-8 TXT → 临时 HTTP 服务
+     * （随机令牌、绑定局域网、下载一次或5分钟超时自动关闭）→ 二维码 + 备用 URL。
+     */
+    private fun startQrShare() {
+        qrImage.visibility = View.GONE
+        qrUrlText.visibility = View.GONE
+        qrHint.text = "正在启动本机下载服务…"
+        val payload = try {
+            DebugLog.dumpText()
+        } catch (t: Throwable) {
+            qrHint.text = "整理日志失败：${t.message}"
+            return
+        }
+        if (payload.length < 50) {
+            qrHint.text = "日志缓冲为空：先「开始记录」并开高德巡航，再生成二维码"
+            return
+        }
+        LogShareServer.start(
+            payload,
+            onReady = { url, err ->
+                if (url == null) {
+                    qrHint.text = "无法分享：$err\n（提示：车机未连 Wi-Fi/热点时二维码不可用）"
+                    DebugLog.line("分享", "服务启动失败: $err")
+                    return@start
+                }
+                val bmp = LogShareServer.qrBitmap(url)
+                if (bmp != null) {
+                    qrImage.setImageBitmap(bmp)
+                    qrImage.visibility = View.VISIBLE
+                }
+                qrUrlText.text = "URL（长按复制）：$url"
+                qrUrlText.visibility = View.VISIBLE
+                qrHint.text = "手机连同一局域网后扫码下载；下载一次后服务自动关闭（5分钟超时）。" +
+                    "打不开=客户端隔离，长按 URL 复制重试。日志 ${payload.length} 字节。"
+                DebugLog.line("分享", "服务就绪: $url")
+            },
+            event = { msg ->
+                DebugLog.line("分享", msg)
+                if (this::qrHint.isInitialized) {
+                    qrHint.text = qrHint.text.toString().substringBefore("（服务已") + "\n[$msg]"
+                }
+            }
+        )
+    }
+
+    /** 1.82：长按复制下载 URL 到剪贴板（二维码拍摄不便时）。 */
+    private fun copyUrl() {
+        val url = qrUrlText.text.toString().removePrefix("URL（长按复制）：")
+        if (url.isEmpty()) return
+        val cb = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        cb.setPrimaryClip(android.content.ClipData.newPlainText("HUD日志下载", url))
+        Toast.makeText(this, "已复制 URL", Toast.LENGTH_SHORT).show()
     }
 
     override fun onResume() {
@@ -73,7 +135,7 @@ class MainActivity : Activity() {
         StatusBus.register(statusListener)
         ensureNotificationPermission()
         // 1.81：诊断日志启动标记（区分会话；版本号与构建脚本一致）
-        DebugLog.line("日志", "App 启动，版本=1.81(82) 诊断版（屏幕直读）")
+        DebugLog.line("日志", "App 启动，版本=1.82(83) 诊断版（扫码下载日志）")
         // 1.29：打开 App 直接开始投屏（默认开启，可在界面里关掉）
         autoStartOnLaunch()
     }
@@ -117,6 +179,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         StatusBus.unregister(statusListener)
+        LogShareServer.stop()
         super.onDestroy()
     }
 
@@ -245,6 +308,64 @@ class MainActivity : Activity() {
             updateLogView()
         })
         root.addView(logRow)
+
+        // ───────── 1.82：记录开关 + 扫码下载（车机无文件管理器/存储受限） ─────────
+        root.addView(section("扫码下载日志（手机与车机同一局域网）"))
+
+        val shareRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.START
+        }
+        recButton = button(if (DebugLog.recordingEnabled) "停止记录" else "开始记录") {
+            DebugLog.recordingEnabled = !DebugLog.recordingEnabled
+            recButton.text = if (DebugLog.recordingEnabled) "停止记录" else "开始记录"
+            DebugLog.line("记录", "记录开关 → ${if (DebugLog.recordingEnabled) "开启" else "关闭"}")
+            Toast.makeText(
+                this,
+                if (DebugLog.recordingEnabled) "已开始记录（保留最近10分钟广播日志）" else "已停止记录",
+                Toast.LENGTH_SHORT
+            ).show()
+            updateLogView()
+        }
+        shareRow.addView(recButton)
+        shareRow.addView(space(dp(12)))
+        shareRow.addView(button("手机扫码下载日志") { startQrShare() })
+        root.addView(shareRow)
+
+        qrImage = android.widget.ImageView(this).apply {
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(dp(260), dp(260)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                topMargin = dp(8)
+            }
+        }
+        root.addView(qrImage)
+
+        qrUrlText = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.parseColor("#2FD07E"))
+            typeface = android.graphics.Typeface.MONOSPACE
+            setPadding(0, dp(6), 0, 0)
+            visibility = View.GONE
+            setOnLongClickListener {
+                copyUrl()
+                true
+            }
+        }
+        root.addView(qrUrlText)
+
+        qrHint = TextView(this).apply {
+            textSize = 11f
+            setTextColor(Color.parseColor("#9AA5B1"))
+            setPadding(0, dp(4), 0, dp(8))
+        }
+        root.addView(qrHint)
+        root.addView(hint(
+            "二维码只在本机局域网生效：手机必须连到与车机同一个 Wi-Fi / 热点。" +
+                "若扫码后打不开，多为车机热点开了「客户端隔离」（设备间禁止互访）——" +
+                "此时请长按上方 URL 复制到手机浏览器重试；仍失败就是网络隔离，换手机开热点给车机连。" +
+                "服务下载一次后自动关闭；仅提供本次日志，无目录/上传/远程执行。"
+        ))
 
         buildDisplayPicker(root)
         buildCardEditor(root)

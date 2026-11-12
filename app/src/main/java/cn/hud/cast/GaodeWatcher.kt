@@ -154,16 +154,29 @@ class GaodeWatcher(
                 Log.i(TAG, "收到导航广播 type=$type state=$state sender=$senderPkg")
                 Log.i(TAG, "  extras 完整值: $extraVals")
                 // 1.80：诊断日志——记录每条广播的 action/类型/脱敏 extras。
-                // 坐标/位置/账号类键只记键名；车道 JSON 只记长度不记内容（可能内嵌坐标）
+                // 1.82：键名带数据类型（任务书：extras 键名和数据类型）。
+                // 坐标/位置/账号类键只记键名；其余键记 类型=值
                 DebugLog.line(
                     "广播",
                     "action=$action type=$type state=$state sender=$senderPkg " +
                         (intent.extras?.keySet()?.joinToString(",") { k ->
                             if (sensitiveKey(k)) "$k=<脱敏>"
-                            else if (k == "EXTRA_DRIVE_WAY") "$k=<车道JSON,长度" +
-                                (try { intent.getStringExtra(k)?.length ?: 0 } catch (_: Throwable) { 0 }) + ">"
                             else {
                                 val v = try { intent.extras?.get(k) } catch (_: Throwable) { null }
+                                val typeName = when (v) {
+                                    null -> "null"
+                                    is Int -> "Int"
+                                    is Long -> "Long"
+                                    is Boolean -> "Bool"
+                                    is Float, is Double -> "Float"
+                                    is String -> "String"
+                                    is IntArray -> "IntArray"
+                                    is LongArray -> "LongArray"
+                                    is ShortArray -> "ShortArray"
+                                    is Array<*> -> "Array"
+                                    is ByteArray -> "ByteArray"
+                                    else -> v.javaClass?.simpleName ?: "Object"
+                                }
                                 val s = when (v) {
                                     is Int, is Long, is Boolean, is Float, is Double -> v.toString()
                                     is String -> if (v.length > 60) "<字符串,长度${v.length}>" else v
@@ -171,12 +184,36 @@ class GaodeWatcher(
                                     is LongArray -> v.joinToString(",", "[", "]")
                                     is ShortArray -> v.joinToString(",", "[", "]")
                                     is Array<*> -> v.joinToString(",", "[", "]")
-                                    else -> v?.javaClass?.simpleName ?: "null"
+                                    else -> "·"
                                 }
-                                "$k=$s"
+                                "$k($typeName)=$s"
                             }
                         } ?: "")
                 )
+                // 1.82：原始 JSON 中红绿灯相关片段（任务书第 3 条）——
+                // 字符串 extras（如 EXTRA_DRIVE_WAY 车道 JSON）里含
+                // traffic/light/countdown/灯 的，截取片段（经纬度数字脱敏）。
+                // 每条广播最多 2 段，防日志刷屏。
+                if (DebugLog.recordingEnabled) {
+                    var snippets = 0
+                    for (k in intent.extras?.keySet() ?: emptySet()) {
+                        if (snippets >= 2) break
+                        if (sensitiveKey(k)) continue
+                        val v = try { intent.extras?.get(k) } catch (_: Throwable) { null } as? String ?: continue
+                        if (v.length < 30) continue
+                        val lk = k.lowercase()
+                        val vHasLight = v.contains("traffic", true) || v.contains("light", true) ||
+                            v.contains("countdown", true) || v.contains("灯")
+                        val kHasLight = "light" in lk || "traffic" in lk || "drive_way" in lk
+                        if (!vHasLight && !kHasLight) continue
+                        val masked = v.replace(
+                            Regex("(?i)(\"?(lat|lon|lng|latitude|longitude)\"?\\s*[:=]\\s*)(-?\\d+(\\.\\d+)?)"),
+                            "$1<脱敏>"
+                        )
+                        DebugLog.line("原始JSON", "$k: ${masked.take(400)}")
+                        snippets++
+                    }
+                }
                 lastNavStateCode = state
                 if (type != Int.MIN_VALUE) {
                     // 1.46：滚动记录最近 8 种广播类型（附 extras 键名摘要）

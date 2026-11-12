@@ -1380,11 +1380,17 @@ class AmapProtocol(
         // 区分「发送端没发倒数（门禁）」与「接收端显示问题」
         val secMissing = if (status in 1..3 && seconds < 0) " 【倒数缺失→发送端未下发】" else ""
         // 1.80：诊断日志——解析结果全量落盘（灯色/秒数/来源/列表/失效原因）
+        // 1.82：任务书要求显式标注 解析成功/失败及原因
+        val parseOutcome = when {
+            status in 1..3 && seconds >= 0 -> "成功(灯色+秒数)"
+            status in 1..3 -> "部分成功(仅灯色,秒数缺失)"
+            else -> "失败(无有效灯色: st=$explicit r=$redSec g=$greenSec 全无效)"
+        }
         DebugLog.line(
             "解析",
             "src=$srcLabel st=$explicit r=$redSec g=$greenSec gen=$genSec " +
                 "wr=${pickOptInt(lightSrc, "waitRound") ?: -1} list=$listDump 锁定=$listLocked " +
-                "→ 判定=${if (status in 1..3) status else "无"} 秒=$seconds$secMissing"
+                "→ 判定=${if (status in 1..3) status else "无"} 秒=$seconds$secMissing → $parseOutcome"
         )
         lightDbg = "红绿灯[$srcLabel]" +
             (if (rawDump.isNotEmpty()) "原始=$rawDump → " else "") +
